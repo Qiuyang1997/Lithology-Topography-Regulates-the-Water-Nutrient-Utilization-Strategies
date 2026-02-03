@@ -1,0 +1,477 @@
+
+library(readxl)    # 读取 Excel
+library(writexl)   # 写出 Excel
+library(jsonlite)  # 读写 JSON
+library(MASS)      # mvrnorm
+library(mvtnorm)   # 多元相关工具
+
+
+EXCEL_PATH <- "PATHway to the miture excel fiel"
+BASE_DIR <- dirname(EXCEL_PATH)
+OUT_DIR  <- file.path(BASE_DIR, "outputs")
+RES_DIR  <- file.path(OUT_DIR, "outputs1")
+dir.create(RES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# -----------------------
+# Basic setting
+# -----------------------
+CONFIG <- list(
+  lmwl_slope = 8.81,
+  lmwl_intercept = 11.58,
+  known_conf_level = 0.95,
+  bootstrap_B = 300,
+  grid_rel_span = 0.20,
+  grid_steps = 7,
+  coverage_target_low = 0.80,
+  coverage_target_high = 0.90,
+  epsilon_fraction_mad = 0.10,
+  seed = 42
+)
+set.seed(CONFIG$seed)
+
+# -----------------------
+# Function mode
+# -----------------------
+mahalanobis_distance <- function(x, mu, Sigma_inv) {
+  d <- x - mu
+  as.numeric(t(d) %*% Sigma_inv %*% d)
+}
+
+ellipse_points <- function(mu_u, Sigma_u, conf_level = 0.95, n = 200) {
+  mu <- as.numeric(mu_u)
+  Sigma <- matrix(as.numeric(Sigma_u), nrow = 2, ncol = 2)
+  eig <- eigen(Sigma)
+  vals <- eig$values
+  vecs <- eig$vectors
+  q <- qchisq(conf_level, df = 2)
+  a <- sqrt(q * pmax(vals, 0))
+  theta <- seq(0, 2*pi, length.out = n)
+  circle <- rbind(cos(theta), sin(theta))
+  E <- t(vecs %*% diag(a) %*% circle) + matrix(mu, nrow = n, ncol = 2, byrow = TRUE)
+  E
+}
+
+# Introduce anisotropic jittering
+jitter_points <- function(M, eps_frac = CONFIG$epsilon_fraction_mad) {
+  M <- as.matrix(M)
+  if (nrow(M) == 0) return(M)
+  mad_O <- mad(M[,1], center = median(M[,1], na.rm = TRUE), na.rm = TRUE)
+  mad_H <- mad(M[,2], center = median(M[,2], na.rm = TRUE), na.rm = TRUE)
+  eps_O <- max(eps_frac * mad_O, 1e-4)
+  eps_H <- max(eps_frac * mad_H, 1e-3)
+  J <- cbind(rnorm(nrow(M), sd = eps_O), rnorm(nrow(M), sd = eps_H))
+  M + J
+}
+
+sample_source_value <- function(mean_val, cov_mat) {
+  cov_mat <- matrix(as.numeric(cov_mat), nrow = 2, ncol = 2)
+  tryCatch({
+    mvrnorm(n = 1, mu = mean_val, Sigma = cov_mat)
+  }, error = function(e) {
+    sd_vals <- sqrt(pmax(diag(cov_mat), 1e-6))
+    mean_val + rnorm(2) * sd_vals
+  })
+}
+
+# -----------------------
+# Read Excel
+# -----------------------
+df_source <- read_excel(EXCEL_PATH, sheet = "source")
+df_plant  <- read_excel(EXCEL_PATH, sheet = "plant")
+
+# -----------------------
+# data grouping
+# -----------------------
+source_strata <- unique(df_source[, c("岩性", "位置")])
+plant_strata  <- unique(df_plant[, c("岩性", "位置")])
+strata <- unique(rbind(source_strata, plant_strata))
+strata <- strata[order(strata$岩性, strata$位置), ]
+
+# ==============================================================================
+# Part 1: Estimate unknown sources and write them into JSON
+# ==============================================================================
+
+cat("\n=== Part 1: Estimate unknown sources and write them into JSON ===\n")
+
+# 判断点是否在椭圆内
+point_in_ellipse <- function(x, mu, Sigma, conf_level = 0.95) {
+  Sigma <- matrix(as.numeric(Sigma), nrow = 2, ncol = 2)
+  d <- x - mu
+  d2 <- as.numeric(t(d) %*% solve(Sigma + diag(1e-6, 2)) %*% d)
+  threshold <- qchisq(conf_level, df = 2)
+  return(d2 <= threshold)
+}
+
+for (i in 1:nrow(strata)) {
+  lith <- strata$岩性[i]
+  loc  <- strata$位置[i]
+  
+  K <- df_source[df_source$岩性 == lith & df_source$位置 == loc, ]
+  S <- df_plant[df_plant$岩性 == lith & df_plant$位置 == loc, ]
+  if (nrow(K) == 0 || nrow(S) == 0) next
+  
+  # Given the mean and covariance of the known source (after jittering)
+  K_xy <- K[, c("d18O", "d2H")]
+  K_xy <- K_xy[complete.cases(K_xy), ]
+  K_xy <- jitter_points(K_xy)   
+  muK <- colMeans(K_xy)
+  SigmaK <- if (nrow(K_xy) > 1) tryCatch(cov(K_xy), error = function(e) diag(c(1,1))) else diag(c(1,1))
+  
+  # Determine the out-of-plane point
+  S_xy <- S[, c("d18O", "d2H")]
+  S_xy <- S_xy[complete.cases(S_xy), ]
+  S_xy <- jitter_points(S_xy) 
+  
+  threshold <- qchisq(CONFIG$known_conf_level, df = 2)
+  outside_points <- list()
+  for (j in 1:nrow(S_xy)) {
+    x <- as.numeric(S_xy[j, ])
+    d2 <- tryCatch({
+      Sigma_inv <- solve(SigmaK + diag(1e-6, 2))
+      mahalanobis_distance(x, muK, Sigma_inv)
+    }, error = function(e) Inf)
+    if (is.finite(d2) && d2 > threshold) {
+      outside_points[[length(outside_points) + 1]] <- x
+    }
+  }
+  outside_points_empty <- length(outside_points) == 0
+  
+  # Estimation of unknown sources
+  mu_u <- NULL; Sigma_u <- NULL
+  if (!outside_points_empty) {
+    OP <- do.call(rbind, outside_points)
+    OP <- OP[complete.cases(OP), , drop = FALSE]
+    if (nrow(OP) >= 1) mu_u <- as.numeric(colMeans(OP))
+    if (nrow(OP) >= 2) {
+      Sigma_u <- tryCatch(cov(OP), error = function(e) diag(c(1,1)))
+    } else if (nrow(OP) == 1) {
+      Sigma_u <- diag(c(1,1))
+    }
+  }
+  
+  # Remove the parts that overlap with the known source.
+  if (!is.null(mu_u) && !is.null(Sigma_u)) {
+    E_unknown <- ellipse_points(mu_u, Sigma_u, conf_level = CONFIG$known_conf_level, n = 200)
+    keep_idx <- apply(E_unknown, 1, function(pt) {
+      !point_in_ellipse(pt, muK, SigmaK, conf_level = CONFIG$known_conf_level)
+    })
+    E_filtered <- E_unknown[keep_idx, , drop = FALSE]
+    if (nrow(E_filtered) > 0) {
+      mu_u <- colMeans(E_filtered)
+      Sigma_u <- cov(E_filtered)
+    }
+  }
+  
+  singular_matrix <- FALSE
+  if (!is.null(Sigma_u)) {
+    singular_matrix <- tryCatch({ solve(Sigma_u); FALSE }, error = function(e) TRUE)
+  }
+  
+  # write JSON
+  res_json <- file.path(RES_DIR, paste0("empirical_bayes_", lith, "_", loc, ".json"))
+  res <- list(
+    mu_u_mean = if (!is.null(mu_u)) as.numeric(mu_u) else NULL,
+    Sigma_u_mean = if (!is.null(Sigma_u)) as.list(as.numeric(Sigma_u)) else NULL,
+    outside_points_empty = outside_points_empty,
+    singular_matrix = singular_matrix
+  )
+  write_json(res, res_json, auto_unbox = TRUE, pretty = TRUE)
+  cat(sprintf("写入 JSON: %s, outside_points_empty=%s, singular_matrix=%s\n", 
+              res_json, outside_points_empty, singular_matrix))
+}
+
+# ==============================================================================
+# Part 2: Estimation of Contribution by Approximate Bayesian Mixture Model
+# ==============================================================================
+
+cat("\n=== Part 2: Estimation of Contribution by Approximate Bayesian Mixture Model型 ===\n")
+
+Bmix <- 1000  # Bootstrap
+
+# 判断点是否在椭圆内
+point_in_ellipse <- function(x, mu, Sigma, conf_level = 0.95) {
+  Sigma <- matrix(as.numeric(Sigma), nrow = 2, ncol = 2)
+  d <- x - mu
+  d2 <- as.numeric(t(d) %*% solve(Sigma + diag(1e-6, 2)) %*% d)
+  threshold <- qchisq(conf_level, df = 2)
+  return(d2 <= threshold)
+}
+
+# Estimation function for mixing ratio (Mahalanobis distance + EM + bootstrap, avoiding "Unknown" to explain the known source range)
+estimate_mixture_proportions <- function(XS, mu_sources, Sigma_list, max_iter = 1000, Bmix = 1000) {
+  N <- nrow(XS); m <- nrow(mu_sources)
+  w <- matrix(1/m, nrow = N, ncol = m)
+  
+  # Inverse covariance）
+  Sigma_inv_list <- vector("list", m)
+  for (j in 1:m) {
+    Sj <- Sigma_list[[j]]
+    if (is.null(Sj)) Sj <- diag(c(1,1))
+    Sj <- matrix(as.numeric(Sj), nrow = 2, ncol = 2)
+    Sj <- Sj + diag(1e-6, 2)
+    Sigma_inv_list[[j]] <- tryCatch(solve(Sj), error = function(e) diag(1e6, 2))
+  }
+  
+  # EM迭代
+  for (iter in 1:max_iter) {
+    w_old <- w
+    for (i in 1:N) {
+      xi <- XS[i, ]
+      di <- numeric(m)
+      for (j in 1:m) {
+        muj <- mu_sources[j, ]
+        d <- xi - muj
+        di[j] <- as.numeric(t(d) %*% Sigma_inv_list[[j]] %*% d)
+      }
+      scale <- max(mean(di), 1e-6)
+      weights <- exp(-di / (2 * scale))
+      
+      # If the sample is within any of the known source ellipses, the Unknown weight is forcibly set to 0.
+      if (m > 1) { # exsit Unknown
+        for (j in 1:(m-1)) { 
+          if (point_in_ellipse(xi, mu_sources[j, ], Sigma_list[[j]], conf_level = CONFIG$known_conf_level)) {
+            weights[m] <- 0
+          }
+        }
+      }
+      
+      if (any(is.na(weights)) || sum(weights) == 0) {
+        weights <- rep(1, m)
+      }
+      w[i, ] <- weights / sum(weights)
+    }
+    if (max(abs(w - w_old)) < 1e-6) break
+  }
+  
+  # Bootstrap
+  w_samples <- array(0, dim = c(Bmix, N, m))
+  noise_sd <- apply(XS, 2, sd)
+  noise_sd[is.na(noise_sd) | noise_sd == 0] <- 1e-6
+  
+  for (b in 1:Bmix) {
+    XS_boot <- XS + matrix(rnorm(N * 2, sd = rep(noise_sd, each = N)), nrow = N, ncol = 2)
+    w_boot <- matrix(1/m, nrow = N, ncol = m)
+    for (iter in 1:100) {
+      for (i in 1:N) {
+        xi <- XS_boot[i, ]
+        di <- numeric(m)
+        for (j in 1:m) {
+          muj <- mu_sources[j, ]
+          d <- xi - muj
+          di[j] <- as.numeric(t(d) %*% Sigma_inv_list[[j]] %*% d)
+        }
+        scale <- max(mean(di), 1e-6)
+        weights <- exp(-di / (2 * scale))
+        
+        if (m > 1) {
+          for (j in 1:(m-1)) {
+            if (point_in_ellipse(xi, mu_sources[j, ], Sigma_list[[j]], conf_level = CONFIG$known_conf_level)) {
+              weights[m] <- 0
+            }
+          }
+        }
+        
+        if (any(is.na(weights)) || sum(weights) == 0) {
+          weights <- rep(1, m)
+        }
+        w_boot[i, ] <- weights / sum(weights)
+      }
+    }
+    w_samples[b, , ] <- w_boot
+  }
+  
+  # Result statistics
+  w_mean   <- apply(w_samples, c(2, 3), mean, na.rm = TRUE)
+  w_ci_low <- apply(w_samples, c(2, 3), function(x) quantile(x, probs = 0.025, na.rm = TRUE))
+  w_ci_high<- apply(w_samples, c(2, 3), function(x) quantile(x, probs = 0.975, na.rm = TRUE))
+  
+  group_means <- apply(w_samples, c(1, 3), mean, na.rm = TRUE)
+  P_mean   <- colMeans(group_means, na.rm = TRUE)
+  P_ci_low <- apply(group_means, 2, function(x) quantile(x, probs = 0.025, na.rm = TRUE))
+  P_ci_high<- apply(group_means, 2, function(x) quantile(x, probs = 0.975, na.rm = TRUE))
+  
+  list(
+    w_post = w_mean, w_ci_low = w_ci_low, w_ci_high = w_ci_high,
+    P_mean = P_mean, P_ci_low = P_ci_low, P_ci_high = P_ci_high
+  )
+}
+
+# -----------------------
+# Main Loop
+# -----------------------
+contrib_rows <- list(); ellipse_rows <- list(); summary_rows <- list(); plant_rows <- list()
+
+for (i in 1:nrow(strata)) {
+  lith <- strata$岩性[i]
+  loc  <- strata$位置[i]
+  
+  K <- df_source[df_source$岩性 == lith & df_source$位置 == loc, ]
+  S <- df_plant[df_plant$岩性 == lith & df_plant$位置 == loc, ]
+  if (nrow(K) == 0 || nrow(S) == 0) next
+  
+  # Known source category
+  source_classes <- sort(unique(na.omit(K$Source)))
+  cls_stats <- list()
+  for (cls in source_classes) {
+    sub <- K[K$Source == cls, c("d18O", "d2H")]
+    sub <- sub[complete.cases(sub), ]
+    sub <- jitter_points(sub)   
+    mu <- colMeans(sub)
+    cov_mat <- if (nrow(sub) > 1) cov(sub) else diag(c(1,1))
+    cls_stats[[cls]] <- list(mu = mu, cov = cov_mat)
+  }
+  
+  # Read parameters from an unknown source
+  res_json <- file.path(RES_DIR, paste0("empirical_bayes_", lith, "_", loc, ".json"))
+  mu_u <- NULL; Sigma_u <- NULL
+  outside_empty <- FALSE; singular <- FALSE
+  if (file.exists(res_json)) {
+    res <- fromJSON(res_json)
+    mu_u <- res$mu_u_mean
+    if (!is.null(mu_u) && length(mu_u) == 2) mu_u <- as.numeric(mu_u) else mu_u <- NULL
+    Sigma_u <- if (!is.null(res$Sigma_u_mean)) matrix(as.numeric(res$Sigma_u_mean), nrow = 2) else NULL
+    outside_empty <- isTRUE(res$outside_points_empty)
+    singular <- isTRUE(res$singular_matrix)
+  }
+  
+  include_unknown <- !is.null(mu_u)
+  unknown_skipped <- !include_unknown
+  if (include_unknown) {
+    if (is.null(Sigma_u)) Sigma_u <- diag(c(1,1))
+    Sigma_u <- Sigma_u + diag(1e-6, 2)
+  }
+  
+  cols <- source_classes
+  if (include_unknown) cols <- c(cols, "Unknown")
+  
+  XS <- as.matrix(S[, c("d18O", "d2H")])
+  XS <- XS[complete.cases(XS), , drop = FALSE]
+  XS <- jitter_points(XS)   
+  N <- nrow(XS)
+  if (N == 0 || length(cols) == 0) next
+  
+  mu_sources <- matrix(0, nrow = length(cols), ncol = 2)
+  Sigma_list <- vector("list", length(cols))
+  for (j in 1:length(source_classes)) {
+    mu_sources[j, ] <- cls_stats[[source_classes[j]]]$mu
+    Sigma_list[[j]] <- cls_stats[[source_classes[j]]]$cov
+  }
+  if (include_unknown) {
+    mu_sources[length(cols), ] <- mu_u
+    Sigma_list[[length(cols)]] <- Sigma_u
+  }
+  
+  # Call the estimation function
+  result <- tryCatch({
+    estimate_mixture_proportions(XS, mu_sources, Sigma_list, max_iter = 1000, Bmix = Bmix)
+  }, error = function(e) {
+    cat(sprintf("跳过: 岩性=%s, 位置=%s, 原因=%s\n", lith, loc, e$message))
+    NULL
+  })
+  
+  if (is.null(result)) {
+    summary_rows[[length(summary_rows) + 1]] <- list(
+      岩性 = lith, 位置 = loc,
+      outside_points_empty = outside_empty,
+      singular_matrix = singular,
+      UnknownSkipped = unknown_skipped,
+      SkippedDueToNA = TRUE
+    )
+    next
+  }
+  
+  # write results
+  w_post   <- result$w_post
+  w_ci_low <- result$w_ci_low
+  w_ci_high<- result$w_ci_high
+  
+  out_row <- list(岩性 = lith, 位置 = loc, N = N)
+  for (j in 1:length(cols)) {
+    name <- cols[j]
+    out_row[[paste0(name, "_mean")]]    <- result$P_mean[j]
+    out_row[[paste0(name, "_ci_low")]]  <- result$P_ci_low[j]
+    out_row[[paste0(name, "_ci_high")]] <- result$P_ci_high[j]
+  }
+  contrib_rows[[length(contrib_rows) + 1]] <- out_row
+  
+  # 每个植物样本贡献
+  for (ii in 1:N) {
+    plant_row <- list(岩性 = lith, 位置 = loc, PlantIndex = ii)
+    for (j in 1:length(cols)) {
+      name <- cols[j]
+      plant_row[[paste0(name, "_mean")]]    <- w_post[ii, j]
+      plant_row[[paste0(name, "_ci_low")]]  <- w_ci_low[ii, j]
+      plant_row[[paste0(name, "_ci_high")]] <- w_ci_high[ii, j]
+    }
+    plant_rows[[length(plant_rows) + 1]] <- plant_row
+  }
+  
+  # summary
+  summary_rows[[length(summary_rows) + 1]] <- list(
+    岩性 = lith, 位置 = loc,
+    outside_points_empty = outside_empty,
+    singular_matrix = singular,
+    UnknownSkipped = unknown_skipped,
+    SkippedDueToNA = FALSE
+  )
+  
+  # The unknown source range is saved as an elliptical point set.
+  if (include_unknown) {
+    E <- ellipse_points(mu_u, Sigma_u, conf_level = CONFIG$known_conf_level, n = 200)
+    ellipse_df <- data.frame(
+      岩性 = lith,
+      位置 = loc,
+      usable = TRUE,
+      PointID = 1:nrow(E),
+      d18O = E[,1],
+      d2H = E[,2]
+    )
+    ellipse_rows[[length(ellipse_rows) + 1]] <- ellipse_df
+  } else {
+    ellipse_df <- data.frame(
+      岩性 = lith,
+      位置 = loc,
+      usable = FALSE,
+      PointID = NA,
+      d18O = NA,
+      d2H = NA
+    )
+    ellipse_rows[[length(ellipse_rows) + 1]] <- ellipse_df
+  }
+}
+
+# -----------------------
+# output Excel
+# -----------------------
+safe_rbind <- function(rows_list) {
+  if (length(rows_list) == 0) return(data.frame())
+  all_cols <- sort(unique(unlist(lapply(rows_list, names))))
+  fill_fun <- function(r) {
+    out <- setNames(vector("list", length(all_cols)), all_cols)
+    for (nm in all_cols) {
+      out[[nm]] <- if (!is.null(r[[nm]])) r[[nm]] else NA
+    }
+    as.data.frame(out, stringsAsFactors = FALSE)
+  }
+  df_list <- lapply(rows_list, fill_fun)
+  do.call(rbind, df_list)
+}
+
+df_contrib <- safe_rbind(contrib_rows)
+summary_df <- safe_rbind(summary_rows)
+df_plants  <- safe_rbind(plant_rows)
+
+
+df_ellipse <- do.call(rbind, ellipse_rows)
+
+excel_path <- file.path(RES_DIR, "empirical_bayes_summary_all.xlsx")
+sheets <- list(
+  Summary = summary_df,
+  Contributions_group = df_contrib,
+  Contributions_plants = df_plants,
+  UnknownEllipsePoints = df_ellipse
+)
+write_xlsx(sheets, excel_path)
+
+cat(sprintf("\n all results save to Excel: %s\n", excel_path))
+
